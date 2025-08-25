@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -44,6 +46,11 @@ type Info struct {
 	DeviceFingerprint string      `json:"device_fingerprint"`
 	Error             string      `json:"error,omitempty"`
 }
+
+var (
+	flagInstall = flag.Bool("install-autostart", false, "")
+	flagRemove  = flag.Bool("remove-autostart", false, "")
+)
 
 func gatherInterfacesFiltered() ([]IfaceInfo, error) {
 	ifaces, err := net.Interfaces()
@@ -80,10 +87,7 @@ func gatherInterfacesFiltered() ([]IfaceInfo, error) {
 
 func isVirtualOrTransient(name string) bool {
 	n := strings.ToLower(name)
-	prefixes := []string{
-		"lo", "docker", "br-", "veth", "tun", "tap", "ppp", "wg", "zt", "tailscale",
-		"vmnet", "vboxnet", "br",
-	}
+	prefixes := []string{"lo", "docker", "br-", "veth", "tun", "tap", "ppp", "wg", "zt", "tailscale", "vmnet", "vboxnet", "br"}
 	for _, p := range prefixes {
 		if n == p || strings.HasPrefix(n, p) {
 			return true
@@ -107,11 +111,7 @@ func choosePrimary(ifaces []IfaceInfo) *IfaceInfo {
 }
 
 func getPublicIP() (string, error) {
-	providers := []string{
-		"https://api.ipify.org",
-		"https://checkip.amazonaws.com",
-		"https://ifconfig.me/ip",
-	}
+	providers := []string{"https://api.ipify.org", "https://checkip.amazonaws.com", "https://ifconfig.me/ip"}
 	client := &http.Client{Timeout: 4 * time.Second}
 	for _, url := range providers {
 		resp, err := client.Get(url)
@@ -133,11 +133,7 @@ func getPublicIP() (string, error) {
 
 func buildFingerprint(hostname string, macs []string) string {
 	sort.Strings(macs)
-	base := strings.Join([]string{
-		hostname,
-		strings.Join(macs, ","),
-		runtime.GOOS + "/" + runtime.GOARCH,
-	}, "|")
+	base := strings.Join([]string{hostname, strings.Join(macs, ","), runtime.GOOS + "/" + runtime.GOARCH}, "|")
 	sum := sha256.Sum256([]byte(base))
 	return hex.EncodeToString(sum[:])
 }
@@ -145,7 +141,6 @@ func buildFingerprint(hostname string, macs []string) string {
 func getProcessorID() string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-
 	switch runtime.GOOS {
 	case "windows":
 		out, err := exec.CommandContext(ctx, "wmic", "cpu", "get", "ProcessorId").CombinedOutput()
@@ -243,16 +238,10 @@ func guessLaptopMAC(ifaces []IfaceInfo, primary *IfaceInfo) string {
 }
 
 func getInfo() Info {
-	info := Info{
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		OS:        runtime.GOOS,
-		Arch:      runtime.GOARCH,
-	}
-
+	info := Info{Timestamp: time.Now().UTC().Format(time.RFC3339), OS: runtime.GOOS, Arch: runtime.GOARCH}
 	if h, err := os.Hostname(); err == nil {
 		info.Hostname = h
 	}
-
 	if u, err := user.Current(); err == nil {
 		name := u.Username
 		if name == "" {
@@ -260,7 +249,6 @@ func getInfo() Info {
 		}
 		info.Username = name
 	}
-
 	if runtime.GOOS == "linux" {
 		if mid, err := os.ReadFile("/etc/machine-id"); err == nil {
 			info.MachineID = strings.TrimSpace(string(mid))
@@ -269,20 +257,16 @@ func getInfo() Info {
 			info.ProductUUID = strings.TrimSpace(string(pu))
 		}
 	}
-
 	ifaces, err := gatherInterfacesFiltered()
 	if err == nil {
 		info.Interfaces = ifaces
 	}
-
 	if p := choosePrimary(info.Interfaces); p != nil {
 		info.PrimaryInterface = p
 	}
-
 	if ip, err := getPublicIP(); err == nil {
 		info.PublicIP = ip
 	}
-
 	var macs []string
 	for _, i := range info.Interfaces {
 		if i.MAC != "" {
@@ -292,7 +276,6 @@ func getInfo() Info {
 	info.DeviceFingerprint = buildFingerprint(info.Hostname, macs)
 	info.ProcessorID = getProcessorID()
 	info.LaptopMAC = guessLaptopMAC(info.Interfaces, info.PrimaryInterface)
-
 	return info
 }
 
@@ -306,10 +289,181 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	_ = enc.Encode(info)
 }
 
+func exePath() string {
+	p, _ := os.Executable()
+	pp, _ := filepath.EvalSymlinks(p)
+	return pp
+}
+
+func run(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func ensureAutostartInstall() error {
+	switch runtime.GOOS {
+	case "windows":
+		return installAutostartWindows()
+	case "linux":
+		return installAutostartLinux()
+	default:
+		return fmt.Errorf("autostart not implemented for %s", runtime.GOOS)
+	}
+}
+
+func ensureAutostartRemove() error {
+	switch runtime.GOOS {
+	case "windows":
+		return removeAutostartWindows()
+	case "linux":
+		return removeAutostartLinux()
+	default:
+		return fmt.Errorf("autostart not implemented for %s", runtime.GOOS)
+	}
+}
+
+func installAutostartWindows() error {
+	ep := exePath()
+	err := run("schtasks.exe", "/Create", "/TN", "DeviceInfoAPI", "/SC", "ONSTART", "/TR", fmt.Sprintf(`"%s"`, ep), "/RL", "HIGHEST", "/RU", "SYSTEM", "/F")
+	if err == nil {
+		_ = run("schtasks.exe", "/Run", "/TN", "DeviceInfoAPI")
+		return nil
+	}
+	err = run("schtasks.exe", "/Create", "/TN", "DeviceInfoAPI", "/SC", "ONLOGON", "/TR", fmt.Sprintf(`"%s"`, ep), "/RL", "HIGHEST", "/F")
+	if err == nil {
+		_ = run("schtasks.exe", "/Run", "/TN", "DeviceInfoAPI")
+		return nil
+	}
+	return fmt.Errorf("failed to create scheduled task: %v", err)
+}
+
+func removeAutostartWindows() error {
+	return run("schtasks.exe", "/Delete", "/TN", "DeviceInfoAPI", "/F")
+}
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(dst, mode)
+}
+
+func installAutostartLinux() error {
+	ep := exePath()
+	tmp := filepath.Join(os.TempDir(), "device-info.service")
+	unitSys := `[Unit]
+				Description=Device Info API
+				After=network-online.target
+				Wants=network-online.target
+
+				[Service]
+				ExecStart=/opt/device-info/device-info
+				Restart=always
+				RestartSec=5
+				WorkingDirectory=/opt/device-info
+
+				[Install]
+				WantedBy=multi-user.target
+				`
+	if err := os.WriteFile(tmp, []byte(unitSys), 0644); err == nil {
+		if err := run("sudo", "install", "-D", ep, "/opt/device-info/device-info"); err == nil {
+			if err := run("sudo", "mv", tmp, "/etc/systemd/system/device-info.service"); err == nil {
+				_ = run("sudo", "systemctl", "daemon-reload")
+				_ = run("sudo", "systemctl", "enable", "--now", "device-info.service")
+				return nil
+			}
+		}
+	}
+	home, _ := os.UserHomeDir()
+	dest := filepath.Join(home, ".local", "bin", "device-info")
+	if err := copyFile(ep, dest, 0755); err != nil {
+		return err
+	}
+	unitUser := `[Unit]
+				Description=Device Info API (user)
+				After=network-online.target
+
+				[Service]
+				ExecStart=` + dest + `
+				Restart=always
+				RestartSec=5
+				WorkingDirectory=` + home + `
+
+				[Install]
+				WantedBy=default.target
+				`
+	userUnitPath := filepath.Join(home, ".config", "systemd", "user", "device-info.service")
+	if err := os.MkdirAll(filepath.Dir(userUnitPath), 0755); err == nil {
+		if err := os.WriteFile(userUnitPath, []byte(unitUser), 0644); err == nil {
+			_ = run("systemctl", "--user", "daemon-reload")
+			if err := run("systemctl", "--user", "enable", "--now", "device-info.service"); err == nil {
+				return nil
+			}
+		}
+	}
+	desktopDir := filepath.Join(home, ".config", "autostart")
+	_ = os.MkdirAll(desktopDir, 0755)
+	desktop := `[Desktop Entry]
+				Type=Application
+				Name=Device Info API
+				Exec=` + dest + `
+				X-GNOME-Autostart-enabled=true
+				`
+	_ = os.WriteFile(filepath.Join(desktopDir, "device-info.desktop"), []byte(desktop), 0644)
+	line := fmt.Sprintf(`@reboot "%s" >/tmp/device-info.log 2>&1`, dest)
+	_ = exec.Command("bash", "-c", `(crontab -l 2>/dev/null; echo '`+line+`') | crontab -`).Run()
+	return nil
+}
+
+func removeAutostartLinux() error {
+	_ = run("sudo", "systemctl", "disable", "--now", "device-info.service")
+	_ = run("sudo", "rm", "-f", "/etc/systemd/system/device-info.service")
+	_ = run("sudo", "rm", "-f", "/opt/device-info/device-info")
+	_ = run("sudo", "systemctl", "daemon-reload")
+	home, _ := os.UserHomeDir()
+	_ = run("systemctl", "--user", "disable", "--now", "device-info.service")
+	_ = os.Remove(filepath.Join(home, ".config", "systemd", "user", "device-info.service"))
+	_ = os.Remove(filepath.Join(home, ".config", "autostart", "device-info.desktop"))
+	_ = exec.Command("bash", "-c", `crontab -l 2>/dev/null | grep -v device-info | crontab -`).Run()
+	_ = os.Remove(filepath.Join(home, ".local", "bin", "device-info"))
+	return nil
+}
+
 func main() {
-	http.HandleFunc("/get-info", handler)
-	fmt.Println("listening on http://localhost:8011/get-info")
-	if err := http.ListenAndServe(":8011", nil); err != nil {
+	flag.Parse()
+	if *flagInstall {
+		if err := ensureAutostartInstall(); err != nil {
+			fmt.Println(err)
+		}
+		return
+	}
+	if *flagRemove {
+		if err := ensureAutostartRemove(); err != nil {
+			fmt.Println(err)
+		}
+		return
+	}
+	http.HandleFunc("/get-device-info", handler)
+	fmt.Println("listening on http://localhost:58080/get-device-info")
+	if err := http.ListenAndServe(":58080", nil); err != nil {
 		panic(err)
 	}
 }
